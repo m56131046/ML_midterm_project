@@ -1,0 +1,6 @@
+streamlit
+fast-flights
+openai
+scikit-learn
+numpy
+pandas

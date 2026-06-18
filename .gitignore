@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Streamlit 本機 Secrets（絕對不能上傳！）
+.streamlit/secrets.toml
+
+# Kaggle 資料集（檔案太大）
+data_kaggle/
+
+# 其他
+.DS_Store
