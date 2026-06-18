@@ -1,5 +1,6 @@
 streamlit
 fast-flights
+primp
 openai
 scikit-learn
 numpy

@@ -10,7 +10,14 @@ import datetime
 import numpy as np
 import streamlit as st
 from openai import OpenAI
-from fast_flights import FlightData, Passengers, create_filter, get_flights_from_filter
+
+# fast_flights 使用 Rust 套件 primp；某些雲端環境無對應 wheel 時會 ImportError
+# → 優雅降級：顯示 Demo 模擬資料，不影響 ML 預測與費用計算功能
+try:
+    from fast_flights import FlightData, Passengers, create_filter, get_flights_from_filter
+    FAST_FLIGHTS_OK = True
+except Exception:
+    FAST_FLIGHTS_OK = False
 
 # ── 頁面設定 ──────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -165,8 +172,62 @@ def predict_price(current_fare: int, days_now: int, days_future: int) -> int:
 
     return max(0, round(predicted / 100) * 100)
 
+def _demo_flights(to_airport: str):
+    """
+    fast_flights 不可用時的模擬航班資料。
+    用 dataclass 模擬 fast_flights Flight 物件介面。
+    """
+    from dataclasses import dataclass
+
+    @dataclass
+    class MockFlight:
+        name: str
+        price: str
+        departure: str
+        arrival: str
+        duration: str
+        stops: int
+
+    # 依目的地返回代表性航班
+    japan  = ["NRT", "HND", "KIX", "FUK", "CTS", "OKA", "NGO"]
+    korea  = ["ICN", "GMP", "PUS"]
+    sea    = ["BKK", "DMK", "SIN", "KUL", "MNL", "CEB", "SGN", "HAN", "DPS"]
+    long   = ["SYD", "MEL", "LAX", "SFO", "JFK", "LHR", "AMS", "VIE"]
+
+    if to_airport in japan:
+        return [
+            MockFlight("Tigerair Taiwan", "NT$3,500", "08:00", "12:10", "3h 10m", 0),
+            MockFlight("EVA Air",          "NT$5,200", "10:00", "14:20", "4h 00m", 0),
+            MockFlight("China Airlines",   "NT$4,800", "09:30", "13:40", "3h 50m", 0),
+        ]
+    elif to_airport in korea:
+        return [
+            MockFlight("Tigerair Taiwan", "NT$3,200", "09:00", "12:30", "2h 45m", 0),
+            MockFlight("EVA Air",          "NT$4,900", "11:00", "14:30", "2h 45m", 0),
+            MockFlight("China Airlines",   "NT$4,500", "13:00", "16:30", "2h 45m", 0),
+        ]
+    elif to_airport in sea:
+        return [
+            MockFlight("Tigerair Taiwan", "NT$4,500", "00:30", "03:50", "4h 20m", 0),
+            MockFlight("EVA Air",          "NT$6,800", "08:00", "11:20", "4h 20m", 0),
+            MockFlight("China Airlines",   "NT$6,200", "09:00", "12:20", "4h 20m", 0),
+        ]
+    else:  # long-haul
+        return [
+            MockFlight("EVA Air",        "NT$18,500", "10:00", "16:00", "12h 00m", 1),
+            MockFlight("China Airlines", "NT$17,200", "09:00", "15:00", "13h 00m", 1),
+        ]
+
+
 def fetch_flights(from_airport: str, to_airport: str, date: str):
-    """向 Google Flights 查詢台灣籍航空班次。"""
+    """
+    向 Google Flights 查詢台灣籍航空班次。
+    若 fast_flights 不可用（雲端環境缺少 wheel），回傳 Demo 模擬資料。
+    """
+    if not FAST_FLIGHTS_OK:
+        # Demo 模式：直接回傳模擬航班（ML 預測與費用計算仍正常運作）
+        return _demo_flights(to_airport)
+
     query_filter = create_filter(
         flight_data=[FlightData(date=date, from_airport=from_airport, to_airport=to_airport)],
         trip="one-way",
@@ -237,6 +298,14 @@ def days_label(days: int) -> str:
 # ── UI：頁面標題 ──────────────────────────────────────────────────────────────
 st.title("✈️ AI-Powered True Cost Flight Comparison")
 st.caption("透過 AI 計算「真實總費用」並預測未來票價，幫助你決定現在買還是等待")
+
+# Demo 模式提示（fast_flights 在雲端環境無法取得即時 Google Flights 資料時顯示）
+if not FAST_FLIGHTS_OK:
+    st.info(
+        "ℹ️ **Demo 模式**：目前使用模擬航班資料（雲端環境限制，無法直接查詢 Google Flights）。"
+        "票價預測（ML）與附加費用計算功能完全正常。",
+        icon="ℹ️",
+    )
 
 st.divider()
 
