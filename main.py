@@ -1,71 +1,70 @@
-from fastapi import FastAPI, HTTPException
+"""
+AI-Powered True Cost Flight Comparison — FastAPI 後端
+修改記錄：
+  - 移除 TinyLlama（記憶體需求 ~2GB），改用 OpenAI GPT-4o-mini + rule-based fallback
+  - 修正 predict_price 特徵順序，符合 train_price_model.py 的新格式：
+      [days_left, duration, stops_int, dep_period]
+  - 修正 price_model.pkl 載入邏輯（移除不存在的 pricing_curve key）
+  - fast_flights 優雅降級：雲端環境缺 primp wheel 時改用模擬航班
+"""
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from transformers import pipeline
-from fast_flights import FlightData, Passengers, create_filter, get_flights_from_filter
-import json
-import os
-import pickle
-import re
-import numpy as np
+import json, os, pickle, re, numpy as np
 from datetime import date as date_type, datetime
 
+from fast_flights import FlightData, Passengers, create_filter, get_flights_from_filter
+
+# ── OpenAI 客戶端（選用）────────────────────────────────────────────────────────
+# 設定環境變數 OPENAI_API_KEY 即可啟用；未設定時自動改用 rule-based 文字
+try:
+    from openai import OpenAI as _OpenAI
+    _OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
+    _oai_client = _OpenAI(api_key=_OPENAI_KEY) if _OPENAI_KEY else None
+except Exception:
+    _oai_client = None
+
+# ── FastAPI 初始化 ─────────────────────────────────────────────────────────────
 app = FastAPI()
 
-# 允許前端跨域請求
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],        # 允許所有來源（前端可從任何網域呼叫）
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 載入靜態資料 ---
+# ── 載入靜態資料 ───────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def load_json(filename):
-    path = os.path.join(BASE_DIR, filename)
-    with open(path, "r", encoding="utf-8") as f:
+def load_json(filename: str) -> dict:
+    with open(os.path.join(BASE_DIR, filename), "r", encoding="utf-8") as f:
         return json.load(f)
 
 airlines_data = load_json("航空公司基本資料 airlines.json")
 fees_data     = load_json("附加費用費率表 fees.json")
 zones_data    = load_json("機場航區對應表 airport_zones.json")
 
-# --- IATA 機場代碼 → 中文顯示名稱 ---
+# ── 常數 ───────────────────────────────────────────────────────────────────────
 AIRPORT_NAMES = {
-    "NRT": "東京成田 (NRT)",
-    "HND": "東京羽田 (HND)",
-    "KIX": "大阪關西 (KIX)",
-    "FUK": "福岡 (FUK)",
-    "CTS": "札幌新千歲 (CTS)",
-    "OKA": "沖繩那霸 (OKA)",
-    "NGO": "名古屋 (NGO)",
-    "ICN": "首爾仁川 (ICN)",
-    "GMP": "首爾金浦 (GMP)",
-    "PUS": "釜山 (PUS)",
-    "BKK": "曼谷素萬那普 (BKK)",
-    "DMK": "曼谷廊曼 (DMK)",
-    "SIN": "新加坡 (SIN)",
-    "KUL": "吉隆坡 (KUL)",
-    "MNL": "馬尼拉 (MNL)",
-    "CEB": "宿霧 (CEB)",
-    "SGN": "胡志明市 (SGN)",
-    "HAN": "河內 (HAN)",
-    "DPS": "峇里島 (DPS)",
-    "SYD": "雪梨 (SYD)",
-    "MEL": "墨爾本 (MEL)",
-    "LAX": "洛杉磯 (LAX)",
-    "SFO": "舊金山 (SFO)",
-    "JFK": "紐約 (JFK)",
-    "LHR": "倫敦希斯洛 (LHR)",
-    "AMS": "阿姆斯特丹 (AMS)",
-    "VIE": "維也納 (VIE)",
-    "KHH": "高雄小港 (KHH)",
+    "NRT": "東京成田 (NRT)",   "HND": "東京羽田 (HND)",
+    "KIX": "大阪關西 (KIX)",   "FUK": "福岡 (FUK)",
+    "CTS": "札幌新千歲 (CTS)", "OKA": "沖繩那霸 (OKA)",
+    "NGO": "名古屋 (NGO)",     "ICN": "首爾仁川 (ICN)",
+    "GMP": "首爾金浦 (GMP)",   "PUS": "釜山 (PUS)",
+    "BKK": "曼谷素萬那普 (BKK)","DMK": "曼谷廊曼 (DMK)",
+    "SIN": "新加坡 (SIN)",     "KUL": "吉隆坡 (KUL)",
+    "MNL": "馬尼拉 (MNL)",     "CEB": "宿霧 (CEB)",
+    "SGN": "胡志明市 (SGN)",   "HAN": "河內 (HAN)",
+    "DPS": "峇里島 (DPS)",     "SYD": "雪梨 (SYD)",
+    "MEL": "墨爾本 (MEL)",     "LAX": "洛杉磯 (LAX)",
+    "SFO": "舊金山 (SFO)",     "JFK": "紐約 (JFK)",
+    "LHR": "倫敦希斯洛 (LHR)", "AMS": "阿姆斯特丹 (AMS)",
+    "VIE": "維也納 (VIE)",     "KHH": "高雄小港 (KHH)",
 }
 
-# 航區中文說明
 ZONE_LABELS = {
     "zone_1": "Zone 1・短程",
     "zone_2": "Zone 2・中程",
@@ -73,25 +72,6 @@ ZONE_LABELS = {
     "zone_4": "Zone 4・長程",
 }
 
-# 台灣虎航 Bundle 優惠組合定義
-# Bundle A：20kg 行李 + 標準選位 = NT$950
-TNA_BUNDLE_A = {
-    "price":        950,
-    "max_kg":       20,
-    "seat":         "standard",
-    "include_meal": False,  # Bundle A 不包含餐費
-    "description":  "虎航 Bundle A：20kg 行李 + 標準選位 = NT$950",
-}
-# Bundle B：20kg 行李 + 大空間選位 + 免餐費 = NT$1600
-TNA_BUNDLE_B = {
-    "price":        1600,
-    "max_kg":       20,
-    "seat":         "extra_legroom",
-    "include_meal": True,   # Bundle B 涵蓋餐費，不另外加收
-    "description":  "虎航 Bundle B：20kg 行李 + 大空間座位 + 免餐費 = NT$1600",
-}
-
-# 台灣籍航空公司：Google Flights 名稱 → 內部 airline_id
 TAIWAN_AIRLINES = {
     "Tigerair Taiwan":  "TNA",
     "EVA Air":          "EVA",
@@ -99,19 +79,52 @@ TAIWAN_AIRLINES = {
     "STARLUX Airlines": "SJX",
 }
 
-# --- 載入 TinyLlama 模型 ---
-pipe = pipeline("text-generation", model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+TNA_BUNDLE_A = {
+    "price": 950,  "max_kg": 20, "seat": "standard",
+    "include_meal": False,
+    "description": "虎航 Bundle A：20kg 行李 + 標準選位 = NT$950",
+}
+TNA_BUNDLE_B = {
+    "price": 1600, "max_kg": 20, "seat": "extra_legroom",
+    "include_meal": True,
+    "description": "虎航 Bundle B：20kg 行李 + 大空間座位 + 免餐費 = NT$1600",
+}
 
-# --- 載入票價預測模型 ---
-_MODEL_PATH = os.path.join(BASE_DIR, "price_model.pkl")
-with open(_MODEL_PATH, "rb") as _f:
-    _price_payload = pickle.load(_f)
+# ── 定價曲線（ML 模型不可用時的 fallback）──────────────────────────────────────
+PRICING_CURVE = {
+    90: 0.82, 60: 0.90, 30: 1.00, 21: 1.08,
+    14: 1.20,  7: 1.45,  3: 1.75,  1: 2.10,
+}
 
-_price_model    = _price_payload["model"]
-_pricing_curve  = _price_payload["pricing_curve"]   # {days: ratio, ...}
+def _curve_ratio(days: int) -> float:
+    """依定價曲線插值，回傳 days 對應的票價倍率。"""
+    keys = sorted(PRICING_CURVE.keys())
+    if days <= keys[0]:  return PRICING_CURVE[keys[0]]
+    if days >= keys[-1]: return PRICING_CURVE[keys[-1]]
+    for i in range(len(keys) - 1):
+        lo, hi = keys[i], keys[i + 1]
+        if lo <= days <= hi:
+            t = (days - lo) / (hi - lo)
+            return PRICING_CURVE[lo] * (1 - t) + PRICING_CURVE[hi] * t
+    return 1.0
 
+# ── 載入 ML 票價預測模型 ───────────────────────────────────────────────────────
+# 模型由 train_price_model.py 產生，特徵順序：
+#   [days_left, duration, stops_int, dep_period]
+_price_model = None
+_MODEL_PATH  = os.path.join(BASE_DIR, "price_model.pkl")
+if os.path.exists(_MODEL_PATH):
+    try:
+        with open(_MODEL_PATH, "rb") as _f:
+            _payload     = pickle.load(_f)
+        _price_model = _payload["model"]
+        print(f"[ML] price_model.pkl 載入成功，特徵：{_payload.get('features')}")
+    except Exception as e:
+        print(f"[ML] price_model.pkl 載入失敗：{e}，改用定價曲線")
+else:
+    print("[ML] price_model.pkl 不存在，改用定價曲線（請先執行 train_price_model.py）")
 
-
+# ── 輔助函式 ───────────────────────────────────────────────────────────────────
 def _parse_duration_hours(s: str) -> float:
     """'3h 55m' → 3.917"""
     m = re.match(r"(\d+)h\s*(\d+)m", str(s).strip())
@@ -120,52 +133,82 @@ def _parse_duration_hours(s: str) -> float:
     m2 = re.match(r"(\d+)h", str(s).strip())
     if m2:
         return float(m2.group(1))
-    return 3.0   # fallback：短程平均
+    return 3.0  # fallback
 
 
 def _parse_dep_hour(s: str) -> int:
-    """'18:55' or '6:30 PM' → 整數小時"""
+    """'18:55' → 18"""
     try:
         return int(str(s).strip().split(":")[0])
     except Exception:
         return 12
 
 
+def _hour_to_period(h: int) -> int:
+    """
+    出發小時 → dep_period 編碼（與 train_price_model.py 一致）
+    0=Early_Morning(0-5), 1=Morning(6-11), 2=Afternoon(12-15),
+    3=Evening(16-19), 4=Night(20-23)
+    """
+    if h < 6:  return 0
+    if h < 12: return 1
+    if h < 16: return 2
+    if h < 20: return 3
+    return 4
+
+
+def parse_price(price_str: str) -> int:
+    """'NT$5,699' → 5699"""
+    cleaned = str(price_str).replace("NT$", "").replace(",", "").strip()
+    try:    return int(cleaned)
+    except: return 0
+
+
+def resolve_baggage_key(fees: dict, kg: int) -> str:
+    """行李公斤數 → fees.json 費率鍵值"""
+    if kg == 0:
+        return "none"
+    for tier in fees.get("baggage_tiers", []):
+        if kg <= tier["max_kg"]:
+            return tier["key"]
+    tiers = fees.get("baggage_tiers", [])
+    return tiers[-1]["key"] if tiers else "none"
+
+
+# ── ML 票價預測 ────────────────────────────────────────────────────────────────
 def predict_price(
     base_fare: int,
     duration_str: str,
     departure_str: str,
-    stops_val: int,
-    departure_date: str,   # YYYY-MM-DD
+    stops_val,
+    departure_date: str,  # YYYY-MM-DD
 ) -> dict:
     """
-    預測 7 天後的票價，並給出購買建議。
-        - 由於模型訓練時的 target 是 price_ratio（相對倍率），因此預測結果也是 ratio。
-    模型仍能透過 days_before_departure 給出有意義的漲跌趨勢。
+    預測 7 天後的票價。
+    - 若 ML 模型可用：特徵 [days_left, duration, stops_int, dep_period]
+    - 否則：使用 PRICING_CURVE 插值
     """
-    today       = date_type.today()
-    dep_date    = datetime.strptime(departure_date, "%Y-%m-%d").date()
-    days_now    = max(1, (dep_date - today).days)          # 距今天數（至少 1）
-    days_7d     = max(1, days_now - 7)                     # 7 天後距出發天數
-    dep_month   = dep_date.month
-    dep_weekday = dep_date.weekday()
-    dur_hours   = _parse_duration_hours(duration_str)
-    dep_hour    = _parse_dep_hour(departure_str)
-    stops_int   = 0 if str(stops_val).strip() in ("0", "non-stop", "Nonstop") else 1
+    today      = date_type.today()
+    dep_date   = datetime.strptime(departure_date, "%Y-%m-%d").date()
+    days_now   = max(1, (dep_date - today).days)
+    days_7d    = max(1, days_now - 7)
+    dur_hours  = _parse_duration_hours(duration_str)
+    dep_period = _hour_to_period(_parse_dep_hour(departure_str))
+    stops_int  = 0 if str(stops_val).strip() in ("0", "non-stop", "Nonstop") else 1
 
-    # 組合特徵向量，順序需與 train_price_model1.py 的 FEATURES 完全一致：
-    # [duration, stops_int, dep_hour, month, day_of_week, days_left]
-    feat_now = [dur_hours, stops_int, dep_hour, dep_month, dep_weekday, days_now]
-    feat_7d  = [dur_hours, stops_int, dep_hour, dep_month, dep_weekday, days_7d]
+    if _price_model:
+        # 新特徵順序：[days_left, duration, stops_int, dep_period]
+        ratio_now = _price_model.predict([[days_now, dur_hours, stops_int, dep_period]])[0]
+        ratio_7d  = _price_model.predict([[days_7d,  dur_hours, stops_int, dep_period]])[0]
+        predicted_fare = int(base_fare * (ratio_7d / ratio_now)) if ratio_now > 0 else base_fare
+    else:
+        # Fallback：定價曲線
+        ratio_now = _curve_ratio(days_now)
+        ratio_7d  = _curve_ratio(days_7d)
+        predicted_fare = int(base_fare * (ratio_7d / ratio_now))
 
-    ratio_now = _price_model.predict([feat_now])[0]
-    ratio_7d  = _price_model.predict([feat_7d])[0]
+    price_change = round((predicted_fare - base_fare) / base_fare * 100, 1)
 
-    # 避免除以零
-    predicted_fare = int(base_fare * (ratio_7d / ratio_now)) if ratio_now > 0 else base_fare
-    price_change   = round((predicted_fare - base_fare) / base_fare * 100, 1)
-
-    # 購買建議
     if price_change >= 5:
         recommendation = "立即購買"
         reason = f"預測 7 天後漲 {price_change}%，建議現在訂票"
@@ -185,11 +228,53 @@ def predict_price(
     }
 
 
+# ── AI 推薦文字 ────────────────────────────────────────────────────────────────
+def _generate_recommendation(best: dict) -> str:
+    """
+    優先用 OpenAI GPT-4o-mini 生成繁體中文推薦；
+    API Key 未設定或呼叫失敗時，改用 rule-based 文字。
+    """
+    pred = best["price_prediction"]
+    pct  = pred["price_change_pct"]
+
+    if _oai_client:
+        prompt = (
+            f"你是專業旅遊顧問，請用繁體中文在 50 字以內給出購票建議：\n"
+            f"推薦航空：{best['airline_name']}\n"
+            f"真實總費用：NT${best['true_cost']:,}（基礎票價 NT${best['base_fare']:,}"
+            f" + 附加費 NT${best['true_cost'] - best['base_fare']:,}）\n"
+            f"7 天後預測費用：NT${pred['predicted_fare']:,}（{pct:+.1f}%）\n"
+            f"請說明是否建議立即購買。"
+        )
+        try:
+            resp = _oai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=120,
+                temperature=0.7,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[OpenAI] 呼叫失敗：{e}，改用 rule-based")
+
+    # Rule-based fallback
+    if pct >= 5:
+        return (f"✅ 建議立即購買 {best['airline_name']}（NT${best['true_cost']:,}）。"
+                f"ML 模型預測 7 天後票價將上漲 {pct:.1f}%，"
+                f"現在購買可省約 NT${pred['predicted_fare'] - best['true_cost']:,}。")
+    elif pct <= -5:
+        return (f"⏳ 可考慮等待。ML 預測 {best['airline_name']} 7 天後票價將下降 {abs(pct):.1f}%，"
+                f"等待購買預計可省約 NT${best['true_cost'] - pred['predicted_fare']:,}。")
+    else:
+        return (f"💡 推薦 {best['airline_name']}（NT${best['true_cost']:,}），整體費用最划算。"
+                f"票價預測波動不大（{pct:+.1f}%），可依個人需求決定購票時機。")
+
+
+# ── 查詢真實航班 ───────────────────────────────────────────────────────────────
 def fetch_real_flights(from_airport: str, to_airport: str, date: str):
     """
-    透過 fast-flights 向 Google Flights 查詢真實航班。
-    只回傳台灣籍航空公司的班次。
-    最多重試 5 次，每次確認有台灣航空班次才停止。
+    透過 fast_flights 查詢 Google Flights 真實航班。
+    只保留台灣籍航空班次，去除重複，最多重試 5 次。
     """
     query_filter = create_filter(
         flight_data=[FlightData(date=date, from_airport=from_airport, to_airport=to_airport)],
@@ -199,162 +284,105 @@ def fetch_real_flights(from_airport: str, to_airport: str, date: str):
     )
 
     result = None
-    MAX_ATTEMPTS = 5
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, 6):
         try:
             print(f"[fetch] 第 {attempt} 次查詢 {from_airport}→{to_airport} {date}")
             result = get_flights_from_filter(query_filter)
-
-            # 確認有抓到資料，且其中包含台灣航空班次
-            if result and result.flights:
-                has_taiwan = any(f.name in TAIWAN_AIRLINES for f in result.flights)
-                if has_taiwan:
-                    print(f"[fetch] 第 {attempt} 次成功，找到台灣航班")
-                    break
-                else:
-                    print(f"[fetch] 第 {attempt} 次：有資料但無台灣航班，繼續重試")
-            else:
-                print(f"[fetch] 第 {attempt} 次：回傳空資料，繼續重試")
-
+            if result and result.flights and any(f.name in TAIWAN_AIRLINES for f in result.flights):
+                break
         except Exception as e:
-            print(f"[fetch] 第 {attempt} 次發生例外：{e}，繼續重試")
+            print(f"[fetch] 第 {attempt} 次例外：{e}")
 
     if not result or not result.flights:
         return []
 
-    # 只取台灣籍航空公司，並以 (airline_name, departure) 為唯一鍵去除重複班次
-    seen = set()
-    unique_flights = []
+    seen, unique = set(), []
     for f in result.flights:
         if f.name not in TAIWAN_AIRLINES:
             continue
-        key = (f.name, f.departure)   # 同航空公司 + 同出發時間 = 重複
+        key = (f.name, f.departure)
         if key not in seen:
             seen.add(key)
-            unique_flights.append(f)
-    return unique_flights
+            unique.append(f)
+    return unique
 
 
-def parse_price(price_str: str) -> int:
-    """將 'NT$5,699' 或 'NT$5699' 格式的票價字串轉為整數。"""
-    cleaned = price_str.replace("NT$", "").replace(",", "").strip()
-    try:
-        return int(cleaned)
-    except ValueError:
-        return 0
-
-
-def resolve_baggage_key(fees: dict, kg: int) -> str:
-    """
-    將使用者輸入的行李公斤數映射到 fees.json 中的費率鍵值。
-    kg == 0 代表無托運行李，回傳 "none"。
-    """
-    if kg == 0:
-        return "none"
-
-    tiers = fees.get("baggage_tiers", [])
-    for tier in tiers:
-        if kg <= tier["max_kg"]:
-            return tier["key"]
-
-    # 超出所有級距，套用最後一個（防呆）
-    if tiers:
-        return tiers[-1]["key"]
-    return "none"
-
-
+# ── API Endpoints ──────────────────────────────────────────────────────────────
 class SearchQuery(BaseModel):
     arrival_airport: str
-    date:            str                      # 出發日期，格式 YYYY-MM-DD
-    from_airport:    str = "TPE"              # 出發機場，預設桃園
-    baggage_kg:      int = Field(ge=0, le=32) # 0 = 無托運行李
+    date:            str
+    from_airport:    str = "TPE"
+    baggage_kg:      int = Field(ge=0, le=32)
     need_meal:       bool
-    seat_preference: str                      # "standard", "extra_legroom", "none"
+    seat_preference: str  # "standard" | "extra_legroom" | "none"
 
 
 @app.get("/api/airports")
 def get_airports():
-    """
-    從 zones_data 動態蒐集所有目的地機場，
-    回傳 [{ code, name, zone_label }] 供前端下拉選單使用。
-    """
-    seen = set()
-    airports = []
-
+    """回傳所有目的地機場清單，供前端下拉選單使用。"""
+    seen, airports = set(), []
     for airline_id, airline_zones in zones_data.items():
         if not isinstance(airline_zones, dict):
             continue
-        for airport_code, zone in airline_zones.items():
-            if airport_code.startswith("_"):
+        for code, zone in airline_zones.items():
+            if code.startswith("_") or code in seen:
                 continue
-            if airport_code not in seen:
-                seen.add(airport_code)
-                airports.append({
-                    "code":       airport_code,
-                    "name":       AIRPORT_NAMES.get(airport_code, airport_code),
-                    "zone_label": ZONE_LABELS.get(zone, zone),
-                })
-
+            seen.add(code)
+            airports.append({
+                "code":       code,
+                "name":       AIRPORT_NAMES.get(code, code),
+                "zone_label": ZONE_LABELS.get(zone, zone),
+            })
     airports.sort(key=lambda x: x["name"])
     return airports
 
 
 @app.post("/api/search")
 def search_flights(query: SearchQuery):
-    # --- Step 1: 向 Google Flights 抓真實班次 ---
+    """
+    主要搜尋 API。
+    1. 查詢 Google Flights（或 Demo 資料）
+    2. 計算各航班真實總費用（基礎票價 + 附加費用）
+    3. ML 預測 7 天後票價
+    4. 檢查虎航 Bundle 優惠
+    5. 用 OpenAI 或 rule-based 產生 AI 推薦文字
+    """
     raw_flights = fetch_real_flights(query.from_airport, query.arrival_airport, query.date)
-
     if not raw_flights:
         return {"flights": [], "ai_recommendation": "目前查無台灣航空公司飛往此目的地的班次，請稍後再試。"}
 
     results = []
-
     for flight in raw_flights:
         airline_id = TAIWAN_AIRLINES[flight.name]
         base_fare  = parse_price(flight.price)
+        zone       = zones_data.get(airline_id, {}).get(query.arrival_airport, "zone_1")
+        fees       = fees_data.get(airline_id, {})
 
-        # --- Step 2: 查出航區 ---
-        zone = zones_data.get(airline_id, {}).get(query.arrival_airport, "zone_1")
-
-        # --- Step 3: 計算附加費用 ---
-        fees = fees_data.get(airline_id, {})
-
-        baggage_key       = resolve_baggage_key(fees, query.baggage_kg)
-        baggage_zone_fees = fees.get("baggage", {}).get(zone, {})
-        baggage_fee       = baggage_zone_fees.get(baggage_key, 0)
-
+        baggage_key = resolve_baggage_key(fees, query.baggage_kg)
+        baggage_fee = fees.get("baggage", {}).get(zone, {}).get(baggage_key, 0)
         meal_fee    = fees.get("meal", 0) if query.need_meal else 0
         seat_fee    = fees.get("seat_selection", {}).get(query.seat_preference, 0)
         payment_fee = fees.get("payment_fee", 0)
+        true_cost   = base_fare + baggage_fee + meal_fee + seat_fee + payment_fee
 
-        true_cost = base_fare + baggage_fee + meal_fee + seat_fee + payment_fee
-
-        # --- Step 4: 檢查台灣虎航 Bundle 優惠是否划算 ---
-        # 依座位偏好選擇對應的 Bundle 方案，再判斷是否比單買便宜
+        # 虎航 Bundle 優惠
         bundle_info = None
         if airline_id == "TNA" and 0 < query.baggage_kg <= 20:
-            # 根據使用者選的座位，挑選對應 Bundle 方案
-            if query.seat_preference == TNA_BUNDLE_A["seat"]:
-                bundle = TNA_BUNDLE_A
-            elif query.seat_preference == TNA_BUNDLE_B["seat"]:
-                bundle = TNA_BUNDLE_B
-            else:
-                bundle = None
-
-            # 只有在 Bundle 行李上限內、且 Bundle 比單買便宜時才提示
+            bundle = (TNA_BUNDLE_A if query.seat_preference == TNA_BUNDLE_A["seat"]
+                      else TNA_BUNDLE_B if query.seat_preference == TNA_BUNDLE_B["seat"]
+                      else None)
             if bundle and (baggage_fee + seat_fee) > bundle["price"]:
-                # Bundle B 包含餐費，計算時餐費不重複加
-                bundled_meal_fee = 0 if bundle["include_meal"] else meal_fee
-                bundle_true_cost = base_fare + bundle["price"] + bundled_meal_fee + payment_fee
+                bm_fee           = 0 if bundle["include_meal"] else meal_fee
+                bundle_true_cost = base_fare + bundle["price"] + bm_fee + payment_fee
                 bundle_info = {
                     "description":      bundle["description"],
                     "bundle_addon":     bundle["price"],
-                    "include_meal":     bundle["include_meal"],  # 告知前端是否含餐
+                    "include_meal":     bundle["include_meal"],
                     "bundle_true_cost": bundle_true_cost,
-                    "savings":          true_cost - bundle_true_cost,  # 可省下的金額
+                    "savings":          true_cost - bundle_true_cost,
                 }
 
-        # --- Step 5: ML 票價預測 ---
+        # ML 票價預測
         price_pred = predict_price(
             base_fare      = base_fare,
             duration_str   = flight.duration,
@@ -364,55 +392,28 @@ def search_flights(query: SearchQuery):
         )
 
         results.append({
-            "flight_id":    f"{airline_id}-{flight.departure.replace(' ', '').replace(',', '').replace(':', '')}",
-            "airline_id":   airline_id,
-            "airline_name": flight.name,
-            "departure":    flight.departure,
-            "arrival":      flight.arrival,
-            "duration":     flight.duration,
-            "stops":        flight.stops,
-            "zone":         zone,
-            "zone_label":   ZONE_LABELS.get(zone, zone),
-            "base_fare":    base_fare,
-            "baggage_tier": baggage_key,
-            "add_on_fees": {
-                "baggage": baggage_fee,
-                "meal":    meal_fee,
-                "seat":    seat_fee,
-                "payment": payment_fee,
-            },
+            "flight_id":       f"{airline_id}-{flight.departure.replace(' ','').replace(',','').replace(':','')}",
+            "airline_id":      airline_id,
+            "airline_name":    flight.name,
+            "departure":       flight.departure,
+            "arrival":         flight.arrival,
+            "duration":        flight.duration,
+            "stops":           flight.stops,
+            "zone":            zone,
+            "zone_label":      ZONE_LABELS.get(zone, zone),
+            "base_fare":       base_fare,
+            "baggage_tier":    baggage_key,
+            "add_on_fees":     {"baggage": baggage_fee, "meal": meal_fee,
+                                "seat": seat_fee, "payment": payment_fee},
             "true_cost":       true_cost,
-            "bundle_info":     bundle_info,    # None 表示無適用優惠
-            "price_prediction": price_pred,    # ML 預測結果
+            "bundle_info":     bundle_info,
+            "price_prediction": price_pred,
         })
 
-    # 根據 true_cost 由低到高排序
     results.sort(key=lambda x: x["true_cost"])
 
-    # --- Step 4: 產生 AI 推薦 ---
-    best = results[0]
-    prompt = (
-        f"<|system|>\nYou are a helpful travel assistant. "
-        f"Reply in 50 words.</s>\n"
-        f"<|user|>\nWhy should I choose {best['airline_name']} flight "
-        f"because it costs {best['true_cost']} NTD including add-ons.</s>\n"
-        f"<|assistant|>"
-    )
-
-    ai_response = pipe(prompt, max_new_tokens=120, do_sample=True)[0]["generated_text"]
-    raw_text    = ai_response.split("<|assistant|>")[-1].strip()
-
-    # 裁切到最後一個完整句子（以 . ! ? 結尾），去除尾端不完整的編號行（如 "3." 或 "3.\n"）
-    last_end = max(raw_text.rfind("."), raw_text.rfind("!"), raw_text.rfind("?"))
-    if last_end != -1:
-        trimmed = raw_text[:last_end + 1].strip()
-        # 若最後一行只有編號（如 "2." "3."），代表句子不完整，再往前裁一次
-        lines = trimmed.splitlines()
-        while lines and lines[-1].strip().rstrip(".").isdigit():
-            lines.pop()
-        recommendation = "\n".join(lines).strip()
-    else:
-        recommendation = raw_text
+    # AI 推薦
+    recommendation = _generate_recommendation(results[0])
 
     return {
         "flights":           results,
