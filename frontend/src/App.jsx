@@ -28,6 +28,10 @@ function getDefaultDate() {
   return d.toISOString().split('T')[0]; // YYYY-MM-DD
 }
 
+// 後端 API 位址：本機開發用 localhost，部署到 Netlify 時改為 Render URL
+// 在 Netlify 環境變數設定 VITE_API_BASE=https://your-app.onrender.com
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
+
 function App() {
   // 目的地機場清單：從後端 /api/airports 動態載入
   const [airports, setAirports] = useState([]);
@@ -50,7 +54,7 @@ function App() {
 
   // 元件載入時，向後端取得目的地機場清單
   useEffect(() => {
-    fetch('http://localhost:8000/api/airports')
+    fetch(`${API_BASE}/api/airports`)
       .then(res => res.json())
       .then(data => {
         setAirports(data);
@@ -87,7 +91,7 @@ function App() {
     try {
       const baggageKg = query.baggage_kg === '' ? 0 : parseInt(query.baggage_kg, 10);
 
-      const response = await fetch('http://localhost:8000/api/search', {
+      const response = await fetch(`${API_BASE}/api/search`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({

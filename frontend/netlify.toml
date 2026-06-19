@@ -1,0 +1,10 @@
+[build]
+  base    = "frontend"
+  command = "npm run build"
+  publish = "dist"
+
+# SPA redirect：所有路徑都回到 index.html，讓 React Router 處理
+[[redirects]]
+  from   = "/*"
+  to     = "/index.html"
+  status = 200

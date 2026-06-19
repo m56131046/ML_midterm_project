@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: truecosflight-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements_backend.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false          # 部署後在 Render 儀表板手動填入

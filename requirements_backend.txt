@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+fast-flights
+primp
+openai
+scikit-learn
+numpy
+pandas
+pydantic
