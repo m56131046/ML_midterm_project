@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-fast-flights
+fast-flights==2.2
 primp
 openai
 scikit-learn
