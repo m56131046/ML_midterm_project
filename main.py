@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 import json, os, pickle, re, numpy as np
 from datetime import date as date_type, datetime
 
-from fast_flights import FlightData, Passengers, create_filter, get_flights_from_filter
+from fast_flights import FlightQuery, Passengers, create_query, get_flights
 
 # ── OpenAI 客戶端（選用）────────────────────────────────────────────────────────
 # 設定環境變數 OPENAI_API_KEY 即可啟用；未設定時自動改用 rule-based 文字
@@ -276,8 +276,8 @@ def fetch_real_flights(from_airport: str, to_airport: str, date: str):
     透過 fast_flights 查詢 Google Flights 真實航班。
     只保留台灣籍航空班次，去除重複，最多重試 5 次。
     """
-    query_filter = create_filter(
-        flight_data=[FlightData(date=date, from_airport=from_airport, to_airport=to_airport)],
+    query = create_query(
+        flights=[FlightQuery(date=date, from_airport=from_airport, to_airport=to_airport)],
         trip="one-way",
         seat="economy",
         passengers=Passengers(adults=1),
@@ -287,7 +287,7 @@ def fetch_real_flights(from_airport: str, to_airport: str, date: str):
     for attempt in range(1, 6):
         try:
             print(f"[fetch] 第 {attempt} 次查詢 {from_airport}→{to_airport} {date}")
-            result = get_flights_from_filter(query_filter)
+            result = get_flights(query)
             if result and result.flights and any(f.name in TAIWAN_AIRLINES for f in result.flights):
                 break
         except Exception as e:

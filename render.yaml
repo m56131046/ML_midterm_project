@@ -8,3 +8,5 @@ services:
     envVars:
       - key: OPENAI_API_KEY
         sync: false          # 部署後在 Render 儀表板手動填入
+      - key: PYTHON_VERSION
+        value: "3.11.9"     # 固定 Python 版本，避免 3.14 的套件相容問題
