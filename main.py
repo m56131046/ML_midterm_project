@@ -11,10 +11,12 @@ AI-Powered True Cost Flight Comparison — FastAPI 後端
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import json, os, pickle, re, numpy as np
+import json, os, pickle, numpy as np
 from datetime import date as date_type, datetime
 
 from fast_flights import FlightQuery, Passengers, create_query, get_flights
+from typing import List, Optional
+from agent import agent_chat   # AI 對話代理（agent.py）
 
 # ── OpenAI 客戶端（選用）────────────────────────────────────────────────────────
 # 設定環境變數 OPENAI_API_KEY 即可啟用；未設定時自動改用 rule-based 文字
@@ -125,23 +127,28 @@ else:
     print("[ML] price_model.pkl 不存在，改用定價曲線（請先執行 train_price_model.py）")
 
 # ── 輔助函式 ───────────────────────────────────────────────────────────────────
-def _parse_duration_hours(s: str) -> float:
-    """'3h 55m' → 3.917"""
-    m = re.match(r"(\d+)h\s*(\d+)m", str(s).strip())
-    if m:
-        return int(m.group(1)) + int(m.group(2)) / 60
-    m2 = re.match(r"(\d+)h", str(s).strip())
-    if m2:
-        return float(m2.group(1))
-    return 3.0  # fallback
+def _simpledatetime_hour(sdt) -> int:
+    """v3.0 SimpleDatetime → 出發小時（int）"""
+    t = sdt.time if sdt.time else []
+    return t[0] if t else 12
 
 
-def _parse_dep_hour(s: str) -> int:
-    """'18:55' → 18"""
-    try:
-        return int(str(s).strip().split(":")[0])
-    except Exception:
-        return 12
+def _simpledatetime_to_str(sdt) -> str:
+    """v3.0 SimpleDatetime → 'HH:MM' 顯示字串"""
+    t = sdt.time if sdt.time else []
+    h = t[0] if len(t) > 0 else 0
+    m = t[1] if len(t) > 1 else 0
+    return f"{h:02d}:{m:02d}"
+
+
+def _minutes_to_hours(minutes: int) -> float:
+    """飛行分鐘數 → 小時（浮點），供 ML 特徵使用"""
+    return minutes / 60
+
+
+def _minutes_to_str(minutes: int) -> str:
+    """飛行分鐘數 → 'Xh Ym' 顯示字串"""
+    return f"{minutes // 60}h {minutes % 60}m"
 
 
 def _hour_to_period(h: int) -> int:
@@ -157,9 +164,11 @@ def _hour_to_period(h: int) -> int:
     return 4
 
 
-def parse_price(price_str: str) -> int:
-    """'NT$5,699' → 5699"""
-    cleaned = str(price_str).replace("NT$", "").replace(",", "").strip()
+def parse_price(price) -> int:
+    """v3.0 price 已是 int；保留字串解析作為 fallback"""
+    if isinstance(price, int):
+        return price
+    cleaned = str(price).replace("NT$", "").replace(",", "").strip()
     try:    return int(cleaned)
     except: return 0
 
@@ -178,29 +187,36 @@ def resolve_baggage_key(fees: dict, kg: int) -> str:
 # ── ML 票價預測 ────────────────────────────────────────────────────────────────
 def predict_price(
     base_fare: int,
-    duration_str: str,
-    departure_str: str,
-    stops_val,
+    total_minutes: int,   # v3.0：各腳段 duration（分鐘）加總
+    dep_hour: int,        # v3.0：第一腳段出發小時
+    stops_int: int,       # v3.0：len(flight.flights) - 1
     departure_date: str,  # YYYY-MM-DD
 ) -> dict:
     """
     預測 7 天後的票價。
-    - 若 ML 模型可用：特徵 [days_left, duration, stops_int, dep_period]
+    - 若 ML 模型可用：特徵 [duration, stops_int, dep_hour, month, day_of_week, days_left]
     - 否則：使用 PRICING_CURVE 插值
     """
-    today      = date_type.today()
-    dep_date   = datetime.strptime(departure_date, "%Y-%m-%d").date()
-    days_now   = max(1, (dep_date - today).days)
-    days_7d    = max(1, days_now - 7)
-    dur_hours  = _parse_duration_hours(duration_str)
-    dep_period = _hour_to_period(_parse_dep_hour(departure_str))
-    stops_int  = 0 if str(stops_val).strip() in ("0", "non-stop", "Nonstop") else 1
-
+    today       = date_type.today()
+    dep_date    = datetime.strptime(departure_date, "%Y-%m-%d").date()
+    days_now    = max(1, (dep_date - today).days)
+    days_7d     = max(1, days_now - 7)
+    dur_hours   = _minutes_to_hours(total_minutes)
     if _price_model:
-        # 新特徵順序：[days_left, duration, stops_int, dep_period]
-        ratio_now = _price_model.predict([[days_now, dur_hours, stops_int, dep_period]])[0]
-        ratio_7d  = _price_model.predict([[days_7d,  dur_hours, stops_int, dep_period]])[0]
-        predicted_fare = int(base_fare * (ratio_7d / ratio_now)) if ratio_now > 0 else base_fare
+        try:
+            # 特徵順序需與 price_model.pkl 訓練時一致：
+            # ['duration', 'stops_int', 'dep_hour', 'month', 'day_of_week', 'days_left']
+            # 訓練時 month/day_of_week 固定為 0，預測時同樣傳 0
+            feat_now = [[float(dur_hours), int(stops_int), int(dep_hour), 0, 0, int(days_now)]]
+            feat_7d  = [[float(dur_hours), int(stops_int), int(dep_hour), 0, 0, int(days_7d)]]
+            ratio_now = _price_model.predict(feat_now)[0]
+            ratio_7d  = _price_model.predict(feat_7d)[0]
+            predicted_fare = int(base_fare * (ratio_7d / ratio_now)) if ratio_now > 0 else base_fare
+        except Exception as e:
+            print(f"[ML] 預測失敗：{e}，改用定價曲線")
+            ratio_now = _curve_ratio(days_now)
+            ratio_7d  = _curve_ratio(days_7d)
+            predicted_fare = int(base_fare * (ratio_7d / ratio_now))
     else:
         # Fallback：定價曲線
         ratio_now = _curve_ratio(days_now)
@@ -271,7 +287,15 @@ def _generate_recommendation(best: dict) -> str:
 
 
 # ── 查詢真實航班 ───────────────────────────────────────────────────────────────
-def fetch_real_flights(from_airport: str, to_airport: str, date: str):
+def fetch_real_flights(
+    from_airport: str,
+    to_airport: str,
+    date: str,
+    adults: int = 1,
+    children: int = 0,
+    infants_in_seat: int = 0,
+    infants_on_lap: int = 0,
+):
     """
     透過 fast_flights 查詢 Google Flights 真實航班。
     只保留台灣籍航空班次，去除重複，最多重試 5 次。
@@ -280,7 +304,12 @@ def fetch_real_flights(from_airport: str, to_airport: str, date: str):
         flights=[FlightQuery(date=date, from_airport=from_airport, to_airport=to_airport)],
         trip="one-way",
         seat="economy",
-        passengers=Passengers(adults=1),
+        passengers=Passengers(
+            adults=adults,
+            children=children,
+            infants_in_seat=infants_in_seat,
+            infants_on_lap=infants_on_lap,
+        ),
     )
 
     result = None
@@ -288,19 +317,22 @@ def fetch_real_flights(from_airport: str, to_airport: str, date: str):
         try:
             print(f"[fetch] 第 {attempt} 次查詢 {from_airport}→{to_airport} {date}")
             result = get_flights(query)
-            if result and result.flights and any(f.name in TAIWAN_AIRLINES for f in result.flights):
+            # v3.0 ResultList 本身就是 list；airlines 為 list，取第一個元素比對
+            if result and any(f.airlines[0] in TAIWAN_AIRLINES for f in result if f.airlines):
                 break
         except Exception as e:
             print(f"[fetch] 第 {attempt} 次例外：{e}")
 
-    if not result or not result.flights:
+    if not result:
         return []
 
     seen, unique = set(), []
-    for f in result.flights:
-        if f.name not in TAIWAN_AIRLINES:
+    for f in result:
+        if not f.airlines or f.airlines[0] not in TAIWAN_AIRLINES:
             continue
-        key = (f.name, f.departure)
+        # 以（航空公司, 第一腳段出發時間）為去重鍵
+        dep_str = _simpledatetime_to_str(f.flights[0].departure) if f.flights else "00:00"
+        key = (f.airlines[0], dep_str)
         if key not in seen:
             seen.add(key)
             unique.append(f)
@@ -309,12 +341,23 @@ def fetch_real_flights(from_airport: str, to_airport: str, date: str):
 
 # ── API Endpoints ──────────────────────────────────────────────────────────────
 class SearchQuery(BaseModel):
-    arrival_airport: str
+    to_airport:      str
     date:            str
     from_airport:    str = "TPE"
     baggage_kg:      int = Field(ge=0, le=32)
     need_meal:       bool
     seat_preference: str  # "standard" | "extra_legroom" | "none"
+    airline_filter:  Optional[str] = None   # "TNA"/"EVA"/"CAL"/"SJX" 或 null（不限）
+    # 乘客人數
+    adults:          int = Field(default=1, ge=1, le=9)   # 成人（12歲以上）
+    children:        int = Field(default=0, ge=0, le=9)   # 兒童（2-11歲）
+    infants_in_seat: int = Field(default=0, ge=0, le=9)   # 占位嬰兒
+    infants_on_lap:  int = Field(default=0, ge=0, le=9)   # 不占位嬰兒
+
+    @property
+    def total_passengers(self) -> int:
+        """總搭乘人數：成人 + 兒童 + 占位嬰兒（不占位嬰兒不佔座位不計入）"""
+        return self.adults + self.children + self.infants_in_seat
 
 
 @app.get("/api/airports")
@@ -347,20 +390,37 @@ def search_flights(query: SearchQuery):
     4. 檢查虎航 Bundle 優惠
     5. 用 OpenAI 或 rule-based 產生 AI 推薦文字
     """
-    raw_flights = fetch_real_flights(query.from_airport, query.arrival_airport, query.date)
+    raw_flights = fetch_real_flights(
+        query.from_airport,
+        query.to_airport,
+        query.date,
+        adults          = query.adults,
+        children        = query.children,
+        infants_in_seat = query.infants_in_seat,
+        infants_on_lap  = query.infants_on_lap,
+    )
     if not raw_flights:
         return {"flights": [], "ai_recommendation": "目前查無台灣航空公司飛往此目的地的班次，請稍後再試。"}
 
     results = []
     for flight in raw_flights:
-        airline_id = TAIWAN_AIRLINES[flight.name]
-        base_fare  = parse_price(flight.price)
-        zone       = zones_data.get(airline_id, {}).get(query.arrival_airport, "zone_1")
-        fees       = fees_data.get(airline_id, {})
+        airline_name = flight.airlines[0]                          # v3.0：airlines 為 list
+        airline_id   = TAIWAN_AIRLINES[airline_name]
+        base_fare    = parse_price(flight.price)                   # v3.0：price 已是 int
+        zone         = zones_data.get(airline_id, {}).get(query.to_airport, "zone_1")
+        fees         = fees_data.get(airline_id, {})
+
+        # v3.0：從腳段列表取出出發／抵達時間與飛行時間
+        first_leg     = flight.flights[0] if flight.flights else None
+        last_leg      = flight.flights[-1] if flight.flights else None
+        dep_str       = _simpledatetime_to_str(first_leg.departure) if first_leg else "00:00"
+        arr_str       = _simpledatetime_to_str(last_leg.arrival)    if last_leg  else "00:00"
+        total_minutes = sum(leg.duration for leg in flight.flights)  # 各腳段分鐘數加總
+        stops_int     = len(flight.flights) - 1                      # 腳段數 - 1 = 轉機次數
 
         baggage_key = resolve_baggage_key(fees, query.baggage_kg)
         baggage_fee = fees.get("baggage", {}).get(zone, {}).get(baggage_key, 0)
-        meal_fee    = fees.get("meal", 0) if query.need_meal else 0
+        meal_fee    = fees.get("meal", 0) * query.total_passengers if query.need_meal else 0
         seat_fee    = fees.get("seat_selection", {}).get(query.seat_preference, 0)
         payment_fee = fees.get("payment_fee", 0)
         true_cost   = base_fare + baggage_fee + meal_fee + seat_fee + payment_fee
@@ -382,33 +442,42 @@ def search_flights(query: SearchQuery):
                     "savings":          true_cost - bundle_true_cost,
                 }
 
-        # ML 票價預測
+        # ML 票價預測（傳入 v3.0 已解析的數值）
         price_pred = predict_price(
             base_fare      = base_fare,
-            duration_str   = flight.duration,
-            departure_str  = flight.departure,
-            stops_val      = flight.stops,
+            total_minutes  = total_minutes,
+            dep_hour       = _simpledatetime_hour(first_leg.departure) if first_leg else 12,
+            stops_int      = stops_int,
             departure_date = query.date,
         )
 
         results.append({
-            "flight_id":       f"{airline_id}-{flight.departure.replace(' ','').replace(',','').replace(':','')}",
-            "airline_id":      airline_id,
-            "airline_name":    flight.name,
-            "departure":       flight.departure,
-            "arrival":         flight.arrival,
-            "duration":        flight.duration,
-            "stops":           flight.stops,
-            "zone":            zone,
-            "zone_label":      ZONE_LABELS.get(zone, zone),
-            "base_fare":       base_fare,
-            "baggage_tier":    baggage_key,
-            "add_on_fees":     {"baggage": baggage_fee, "meal": meal_fee,
-                                "seat": seat_fee, "payment": payment_fee},
-            "true_cost":       true_cost,
-            "bundle_info":     bundle_info,
+            "flight_id":        f"{airline_id}-{dep_str.replace(':','')}",
+            "airline_id":       airline_id,
+            "airline_name":     airline_name,
+            "departure":        dep_str,
+            "arrival":          arr_str,
+            "duration":         _minutes_to_str(total_minutes),
+            "stops":            stops_int,
+            "zone":             zone,
+            "zone_label":       ZONE_LABELS.get(zone, zone),
+            "base_fare":        base_fare,
+            "baggage_tier":     baggage_key,
+            "add_on_fees":      {"baggage": baggage_fee, "meal": meal_fee,
+                                 "seat": seat_fee, "payment": payment_fee},
+            "true_cost":        true_cost,
+            "bundle_info":      bundle_info,
             "price_prediction": price_pred,
         })
+
+    # 航空公司篩選（由 AI Agent 解析使用者偏好後傳入）
+    if query.airline_filter:
+        results = [r for r in results if r["airline_id"] == query.airline_filter]
+        if not results:
+            return {
+                "flights": [],
+                "ai_recommendation": f"查無 {query.airline_filter} 飛往此目的地的班次，請換其他航空或移除篩選條件。"
+            }
 
     results.sort(key=lambda x: x["true_cost"])
 
@@ -419,6 +488,26 @@ def search_flights(query: SearchQuery):
         "flights":           results,
         "ai_recommendation": recommendation,
     }
+
+
+# ── AI 對話代理 Endpoint ───────────────────────────────────────────────────────
+class ChatMessage(BaseModel):
+    role:    str   # "user" | "assistant"
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]   # 完整對話歷史
+
+@app.post("/api/chat")
+def chat(req: ChatRequest):
+    """
+    AI 對話代理：將使用者的自然語言轉為結構化搜尋條件。
+    前端傳入完整對話歷史，Agent 回傳：
+      - {"ready": false, "message": "反問文字"}   ← 繼續對話
+      - {"ready": true, "arrival_airport": "KIX", "date": "...", ...}  ← 觸發搜尋
+    """
+    messages = [{"role": m.role, "content": m.content} for m in req.messages]
+    return agent_chat(messages)
 
 
 if __name__ == "__main__":

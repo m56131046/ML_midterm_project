@@ -39,11 +39,17 @@ function App() {
   // 使用者的搜尋條件
   const [query, setQuery] = useState({
     from_airport:    'TPE',
-    arrival_airport: 'NRT',           // 預設東京成田
+    to_airport:      'NRT',           // 預設東京成田
     date:            getDefaultDate(), // 預設 7 天後
     baggage_kg:      '',              // 空字串 = 無托運行李（送出時轉為 0）
     need_meal:       false,
     seat_preference: 'none',
+    airline_filter:  null,            // AI Agent 解析使用者偏好後填入
+    // 乘客人數
+    adults:          1,
+    children:        0,
+    infants_in_seat: 0,
+    infants_on_lap:  0,
   });
 
   // 行李輸入驗證錯誤訊息
@@ -52,6 +58,107 @@ function App() {
   const [result,  setResult]  = useState(null);
   const [loading, setLoading] = useState(false);
 
+  // ── AI 對話框狀態 ──────────────────────────────────────────────────────────
+  const [chatOpen,     setChatOpen]     = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);  // [{role, content}]
+  const [chatInput,    setChatInput]    = useState('');
+  const [chatLoading,  setChatLoading]  = useState(false);
+
+  // 送出對話訊息給 AI Agent
+  const handleChatSend = async () => {
+    const text = chatInput.trim();
+    if (!text || chatLoading) return;
+
+    const newMessages = [...chatMessages, { role: 'user', content: text }];
+    setChatMessages(newMessages);
+    setChatInput('');
+    setChatLoading(true);
+
+    try {
+      const res  = await fetch(`${API_BASE}/api/chat`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ messages: newMessages }),
+      });
+      const data = await res.json();
+
+      if (data.ready) {
+        // Agent 已收集齊全 → 自動填入表單並觸發搜尋
+        const summary = data.summary || '已為你設定搜尋條件，開始查詢中…';
+        setChatMessages(prev => [...prev, { role: 'assistant', content: `✅ ${summary}` }]);
+
+        // 更新表單欄位（含乘客人數）
+        setQuery(q => ({
+          ...q,
+          to_airport:      data.arrival_airport  ?? q.to_airport,
+          date:            data.date             ?? q.date,
+          baggage_kg:      data.baggage_kg != null ? String(data.baggage_kg) : q.baggage_kg,
+          need_meal:       data.need_meal        ?? q.need_meal,
+          seat_preference: data.seat_preference  ?? q.seat_preference,
+          airline_filter:  data.airline_filter   ?? null,
+          adults:          data.adults           ?? q.adults,
+          children:        data.children         ?? q.children,
+          infants_in_seat: data.infants_in_seat  ?? q.infants_in_seat,
+          infants_on_lap:  data.infants_on_lap   ?? q.infants_on_lap,
+        }));
+
+        // 短暫延遲後自動搜尋（讓 state 更新完成）
+        setTimeout(() => handleSearchWithParams({
+          to_airport:      data.arrival_airport,
+          date:            data.date,
+          baggage_kg:      data.baggage_kg      ?? 0,
+          need_meal:       data.need_meal       ?? false,
+          seat_preference: data.seat_preference ?? 'none',
+          airline_filter:  data.airline_filter  ?? null,
+          adults:          data.adults          ?? 1,
+          children:        data.children        ?? 0,
+          infants_in_seat: data.infants_in_seat ?? 0,
+          infants_on_lap:  data.infants_on_lap  ?? 0,
+        }), 300);
+
+      } else {
+        // Agent 繼續反問
+        setChatMessages(prev => [...prev, { role: 'assistant', content: data.message }]);
+      }
+    } catch (e) {
+      setChatMessages(prev => [...prev,
+        { role: 'assistant', content: '抱歉，連線發生問題，請稍後再試。' }
+      ]);
+    }
+    setChatLoading(false);
+  };
+
+  // 直接帶入參數觸發搜尋（供 Agent 自動觸發用）
+  const handleSearchWithParams = async (params) => {
+    setLoading(true);
+    setResult(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/search`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          from_airport:    query.from_airport,
+          to_airport:      params.to_airport,
+          date:            params.date,
+          baggage_kg:      params.baggage_kg,
+          need_meal:       params.need_meal,
+          seat_preference: params.seat_preference,
+          airline_filter:  params.airline_filter,
+          // 優先用 params 帶來的乘客數（agent 解析的），否則用表單 state
+          adults:          params.adults          ?? query.adults,
+          children:        params.children        ?? query.children,
+          infants_in_seat: params.infants_in_seat ?? query.infants_in_seat,
+          infants_on_lap:  params.infants_on_lap  ?? query.infants_on_lap,
+        }),
+      });
+      const data = await response.json();
+      setResult(data);
+    } catch (error) {
+      console.error('搜尋時發生錯誤:', error);
+    }
+    setLoading(false);
+  };
+
   // 元件載入時，向後端取得目的地機場清單
   useEffect(() => {
     fetch(`${API_BASE}/api/airports`)
@@ -59,7 +166,7 @@ function App() {
       .then(data => {
         setAirports(data);
         if (data.length > 0 && !data.find(a => a.code === 'NRT')) {
-          setQuery(q => ({ ...q, arrival_airport: data[0].code }));
+          setQuery(q => ({ ...q, to_airport: data[0].code }));
         }
       })
       .catch(err => console.error('無法取得機場清單:', err));
@@ -96,11 +203,16 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({
           from_airport:    query.from_airport,
-          arrival_airport: query.arrival_airport,
+          to_airport:      query.to_airport,
           date:            query.date,
           baggage_kg:      baggageKg,
           need_meal:       query.need_meal,
           seat_preference: query.seat_preference,
+          airline_filter:  query.airline_filter,
+          adults:          query.adults,
+          children:        query.children,
+          infants_in_seat: query.infants_in_seat,
+          infants_on_lap:  query.infants_on_lap,
         }),
       });
       const data = await response.json();
@@ -114,6 +226,63 @@ function App() {
   return (
     <div className="container">
       <h1>AI-Powered True Cost Flight Comparison System</h1>
+
+      {/* ── AI 對話框 ─────────────────────────────────────────────────── */}
+      <div className="chat-panel">
+        <button className="chat-toggle" onClick={() => setChatOpen(o => !o)}>
+          💬 用自然語言描述需求 {chatOpen ? '▲' : '▼'}
+        </button>
+
+        {chatOpen && (
+          <div className="chat-body">
+            {/* 對話歷史 */}
+            <div className="chat-history">
+              {chatMessages.length === 0 && (
+                <p className="chat-hint">
+                  試試說：「我想 7/10 去大阪，帶 20kg 行李，只看星宇航班」
+                </p>
+              )}
+              {chatMessages.map((m, i) => (
+                <div key={i} className={`chat-msg ${m.role}`}>
+                  <span className="chat-bubble">{m.content}</span>
+                </div>
+              ))}
+              {chatLoading && (
+                <div className="chat-msg assistant">
+                  <span className="chat-bubble chat-typing">AI 思考中…</span>
+                </div>
+              )}
+            </div>
+
+            {/* 輸入列 */}
+            <div className="chat-input-row">
+              <input
+                className="chat-input"
+                type="text"
+                placeholder="描述你的出行需求…"
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleChatSend()}
+                disabled={chatLoading}
+              />
+              <button
+                className="chat-send"
+                onClick={handleChatSend}
+                disabled={chatLoading || !chatInput.trim()}
+              >
+                送出
+              </button>
+              <button
+                className="chat-clear"
+                onClick={() => setChatMessages([])}
+                title="清除對話"
+              >
+                🗑
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
 
       <div className="search-box">
 
@@ -134,8 +303,8 @@ function App() {
         <label>
           目的地機場_Arrival airport：
           <select
-            value={query.arrival_airport}
-            onChange={e => setQuery({ ...query, arrival_airport: e.target.value })}
+            value={query.to_airport}
+            onChange={e => setQuery({ ...query, to_airport: e.target.value })}
           >
             {airports.length === 0 ? (
               <option value="">載入中...</option>
@@ -205,6 +374,42 @@ function App() {
             <option value="extra_legroom">大空間座位</option>
           </select>
         </label>
+
+        {/* 乘客人數 */}
+        <div className="passengers-group">
+          <label>
+            成人（12歲以上）_Adults：
+            <input
+              type="number" min={1} max={9} step={1}
+              value={query.adults}
+              onChange={e => setQuery({ ...query, adults: parseInt(e.target.value) || 1 })}
+            />
+          </label>
+          <label>
+            兒童（2-11歲）_Children：
+            <input
+              type="number" min={0} max={9} step={1}
+              value={query.children}
+              onChange={e => setQuery({ ...query, children: parseInt(e.target.value) || 0 })}
+            />
+          </label>
+          <label>
+            占位嬰兒（2歲以下）_Infants in seat：
+            <input
+              type="number" min={0} max={9} step={1}
+              value={query.infants_in_seat}
+              onChange={e => setQuery({ ...query, infants_in_seat: parseInt(e.target.value) || 0 })}
+            />
+          </label>
+          <label>
+            不占位嬰兒（2歲以下）_Infants on lap：
+            <input
+              type="number" min={0} max={9} step={1}
+              value={query.infants_on_lap}
+              onChange={e => setQuery({ ...query, infants_on_lap: parseInt(e.target.value) || 0 })}
+            />
+          </label>
+        </div>
 
         <button onClick={handleSearch} disabled={!canSearch}>
           {loading ? '查詢與分析中...' : '計算真實成本'}
