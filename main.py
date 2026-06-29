@@ -164,13 +164,28 @@ def _hour_to_period(h: int) -> int:
     return 4
 
 
+# 美金 → 台幣匯率（固定值，Render 美國伺服器回傳 USD 時使用）
+USD_TO_TWD = int(os.environ.get("USD_TO_TWD", "32"))
+
 def parse_price(price) -> int:
-    """v3.0 price 已是 int；保留字串解析作為 fallback"""
+    """
+    v3.0 price 已是 int；保留字串解析作為 fallback。
+    若價格 < 2000，判定為美金（USD），自動乘以匯率轉換成台幣（TWD）。
+    本機回傳台幣（通常 6000+），Render 美國伺服器回傳美金（通常 200-600）。
+    """
     if isinstance(price, int):
-        return price
-    cleaned = str(price).replace("NT$", "").replace(",", "").strip()
-    try:    return int(cleaned)
-    except: return 0
+        raw = price
+    else:
+        cleaned = str(price).replace("NT$", "").replace(",", "").strip()
+        try:    raw = int(cleaned)
+        except: return 0
+
+    # 價格低於 2000 視為 USD，乘以匯率轉換
+    if raw < 2000:
+        converted = raw * USD_TO_TWD
+        print(f"[price] 偵測到 USD 價格 ${raw}，換算為 NT${converted}（匯率 {USD_TO_TWD}）")
+        return converted
+    return raw
 
 
 def resolve_baggage_key(fees: dict, kg: int) -> str:
@@ -310,8 +325,7 @@ def fetch_real_flights(
             infants_in_seat=infants_in_seat,
             infants_on_lap=infants_on_lap,
         ),
-        currency="TWD",    # 強制使用台幣，避免 Render 美國伺服器回傳 USD 價格
-        language="zh-TW",  # 語系設為繁體中文
+
     )
 
     result = None
