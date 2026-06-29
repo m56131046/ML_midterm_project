@@ -87,23 +87,25 @@ function App() {
         const summary = data.summary || '已為你設定搜尋條件，開始查詢中…';
         setChatMessages(prev => [...prev, { role: 'assistant', content: `✅ ${summary}` }]);
 
-        // 更新表單欄位（含乘客人數）
+        // 更新表單欄位（含出發機場、乘客人數）
         setQuery(q => ({
           ...q,
-          to_airport:      data.arrival_airport  ?? q.to_airport,
-          date:            data.date             ?? q.date,
+          from_airport:    data.from_airport ?? q.from_airport,
+          to_airport:      data.arrival_airport   ?? q.to_airport,
+          date:            data.date              ?? q.date,
           baggage_kg:      data.baggage_kg != null ? String(data.baggage_kg) : q.baggage_kg,
-          need_meal:       data.need_meal        ?? q.need_meal,
-          seat_preference: data.seat_preference  ?? q.seat_preference,
-          airline_filter:  data.airline_filter   ?? null,
-          adults:          data.adults           ?? q.adults,
-          children:        data.children         ?? q.children,
-          infants_in_seat: data.infants_in_seat  ?? q.infants_in_seat,
-          infants_on_lap:  data.infants_on_lap   ?? q.infants_on_lap,
+          need_meal:       data.need_meal         ?? q.need_meal,
+          seat_preference: data.seat_preference   ?? q.seat_preference,
+          airline_filter:  data.airline_filter    ?? null,
+          adults:          data.adults            ?? q.adults,
+          children:        data.children          ?? q.children,
+          infants_in_seat: data.infants_in_seat   ?? q.infants_in_seat,
+          infants_on_lap:  data.infants_on_lap    ?? q.infants_on_lap,
         }));
 
         // 短暫延遲後自動搜尋（讓 state 更新完成）
         setTimeout(() => handleSearchWithParams({
+          from_airport:    data.from_airport,
           to_airport:      data.arrival_airport,
           date:            data.date,
           baggage_kg:      data.baggage_kg      ?? 0,
@@ -137,14 +139,14 @@ function App() {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({
-          from_airport:    query.from_airport,
-          to_airport:      params.to_airport,
-          date:            params.date,
-          baggage_kg:      params.baggage_kg,
-          need_meal:       params.need_meal,
-          seat_preference: params.seat_preference,
-          airline_filter:  params.airline_filter,
-          // 優先用 params 帶來的乘客數（agent 解析的），否則用表單 state
+          // 優先用 params 帶來的值（agent 解析的），否則用表單 state
+          from_airport:    params.from_airport    ?? query.from_airport,
+          to_airport:      params.to_airport      ?? query.to_airport,
+          date:            params.date            ?? query.date,
+          baggage_kg:      params.baggage_kg      ?? query.baggage_kg,
+          need_meal:       params.need_meal       ?? query.need_meal,
+          seat_preference: params.seat_preference ?? query.seat_preference,
+          airline_filter:  params.airline_filter  ?? null,
           adults:          params.adults          ?? query.adults,
           children:        params.children        ?? query.children,
           infants_in_seat: params.infants_in_seat ?? query.infants_in_seat,
