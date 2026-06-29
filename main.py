@@ -310,6 +310,8 @@ def fetch_real_flights(
             infants_in_seat=infants_in_seat,
             infants_on_lap=infants_on_lap,
         ),
+        currency="TWD",    # 強制使用台幣，避免 Render 美國伺服器回傳 USD 價格
+        language="zh-TW",  # 語系設為繁體中文
     )
 
     result = None
